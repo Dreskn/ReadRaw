@@ -1,0 +1,10 @@
+.venv/
+libs/
+testraw/
+__pycache__/
+*.pyc
+*.csv
+*.md
+!README.md
+*.raw
+*.RAW
