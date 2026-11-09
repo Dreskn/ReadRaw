@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import html
 import os
 import re
 import sys
@@ -691,7 +692,8 @@ def inspect_scans(raw, first: int, last: int) -> dict:
         filt = _safe_call(raw.GetFilterForScanNumber, scan)
         if filt is None:
             return ""
-        text = stringify(filt)
+        # str() on the wrapped .NET filter gives its type name; ToString() gives the filter text.
+        text = stringify(_safe_call(filt.ToString, default="")) or stringify(filt)
         order = filter_ms_order(text) or _ms_order_bucket(stringify(getattr(filt, "MSOrder", "")))
         extra = net_properties(filt)
         if extra.get("Polarity"):
@@ -1084,8 +1086,8 @@ def extract_raw_metadata(path: Path, include_method_text: bool = True) -> Ordere
 INTERNAL_KEYS = {"_report_path"}
 
 
-def unique_path(directory: Path, stem: str, suffix: str = ".md") -> Path:
-    """Return directory/stem.md, or directory/stem_1.md if that name is taken."""
+def unique_path(directory: Path, stem: str, suffix: str) -> Path:
+    """Return directory/stem.html, or directory/stem_1.html if that name is taken."""
     candidate = directory / f"{stem}{suffix}"
     if not candidate.exists():
         return candidate
@@ -1123,6 +1125,41 @@ def _summary_rows(record: dict) -> list[tuple[str, str]]:
     return [(SUMMARY_LABELS[key], record.get(key, "")) for key in SUMMARY_KEYS]
 
 
+def _report_groups(record: dict) -> list[tuple[str, list[tuple[str, str]]]]:
+    """Field/value sections of an individual report, after the summary."""
+    used = {
+        "file_name",
+        "file_path",
+        "file_size_mb",
+        "error",
+        "scan_filters",
+        "instrument_method_text",
+        *SUMMARY_KEYS,
+        *INTERNAL_KEYS,
+    }
+    for _, keys in FIELD_GROUPS:
+        used.update(keys)
+
+    groups = [
+        (title, [(key, record.get(key, "")) for key in keys])
+        for title, keys in FIELD_GROUPS
+    ]
+    extras = [(key, value) for key, value in record.items() if key not in used and value]
+    trailer = [(key, value) for key, value in extras if key.startswith("trailer.")]
+    status = [(key, value) for key, value in extras if key.startswith("status.")]
+    other = [
+        (key, value)
+        for key, value in extras
+        if not key.startswith(("trailer.", "status."))
+    ]
+    groups += [
+        ("Other fields", other),
+        ("Scan trailer extra (sampled)", trailer),
+        ("Status log (first scan)", status),
+    ]
+    return groups
+
+
 def write_individual_markdown(record: OrderedDict[str, str] | dict, dest: Path) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     generated = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -1141,34 +1178,8 @@ def write_individual_markdown(record: OrderedDict[str, str] | dict, dest: Path) 
         return
 
     lines.extend(_md_section("Summary", _summary_rows(record), keep_empty=True))
-
-    used = {
-        "file_name",
-        "file_path",
-        "file_size_mb",
-        "error",
-        "scan_filters",
-        "instrument_method_text",
-        *SUMMARY_KEYS,
-        *INTERNAL_KEYS,
-    }
-    for _, keys in FIELD_GROUPS:
-        used.update(keys)
-
-    for title, keys in FIELD_GROUPS:
-        lines.extend(_md_section(title, [(key, record.get(key, "")) for key in keys]))
-
-    extras = [(key, value) for key, value in record.items() if key not in used and value]
-    trailer = [(key, value) for key, value in extras if key.startswith("trailer.")]
-    status = [(key, value) for key, value in extras if key.startswith("status.")]
-    other = [
-        (key, value)
-        for key, value in extras
-        if not key.startswith(("trailer.", "status."))
-    ]
-    lines.extend(_md_section("Other fields", other))
-    lines.extend(_md_section("Scan trailer extra (sampled)", trailer))
-    lines.extend(_md_section("Status log (first scan)", status))
+    for title, pairs in _report_groups(record):
+        lines.extend(_md_section(title, pairs))
 
     if record.get("scan_filters"):
         lines += ["## Scan filters", ""]
@@ -1209,13 +1220,63 @@ def _ordered_keys(records: list[dict]) -> list[str]:
     return keys
 
 
-def _comparison_table(records: list[dict], labels: list[str], keys: list[str]) -> list[str]:
+def _comparison_rows(records: list[dict], keys: list[str]) -> list[tuple[str, list[str]]]:
     rows = []
     for key in keys:
         values = [rec.get(key, "") for rec in records]
-        if not any(values):
-            continue
-        rows.append((key, values))
+        if any(values):
+            rows.append((key, values))
+    return rows
+
+
+OVERVIEW_KEYS = [
+    "error",
+    "sample_name",
+    "sample_id",
+    "method_file",
+    "acquisition_mode",
+    "top_mode",
+    "cycle_time",
+    "fragmentation",
+    "ms1_mz_range",
+    "ms2_mz_range",
+    "ms1_resolution",
+    "ms2_resolution",
+    "instrument_model",
+    "scan_count",
+    "rt_start_min",
+    "rt_end_min",
+    "polarity",
+    "ionization",
+]
+
+
+def _combined_groups(records: list[dict]) -> list[tuple[str, list[str]]]:
+    """Comparison sections of the combined report (long text fields excluded)."""
+    groups = [("Overview", OVERVIEW_KEYS)] + list(FIELD_GROUPS)
+    grouped_keys = {key for _, keys in FIELD_GROUPS for key in keys}
+    remaining = [
+        key
+        for key in _ordered_keys(records)
+        if key not in grouped_keys and key not in LONG_FIELDS
+    ]
+    trailer = [key for key in remaining if key.startswith("trailer.")]
+    status = [key for key in remaining if key.startswith("status.")]
+    other = [
+        key
+        for key in remaining
+        if not key.startswith(("trailer.", "status."))
+    ]
+    groups += [
+        ("Other fields", other),
+        ("Scan trailer extra (sampled)", trailer),
+        ("Status log (first scan)", status),
+    ]
+    return groups
+
+
+def _comparison_table(records: list[dict], labels: list[str], keys: list[str]) -> list[str]:
+    rows = _comparison_rows(records, keys)
     if not rows:
         return []
     header = "| Field | " + " | ".join(_md_escape(label) for label in labels) + " |"
@@ -1266,60 +1327,11 @@ def write_combined_markdown(records: list[dict], dest: Path) -> None:
         lines.append(
             f"| {_md_escape(rec.get('file_name', ''))} | {_md_escape(label)} | {report_cell} |"
         )
-    lines += ["", "## Overview", ""]
-    lines += _comparison_table(
-        records,
-        labels,
-        [
-            "error",
-            "sample_name",
-            "sample_id",
-            "method_file",
-            "acquisition_mode",
-            "top_mode",
-            "cycle_time",
-            "fragmentation",
-            "ms1_mz_range",
-            "ms2_mz_range",
-            "ms1_resolution",
-            "ms2_resolution",
-            "instrument_model",
-            "scan_count",
-            "rt_start_min",
-            "rt_end_min",
-            "polarity",
-            "ionization",
-        ],
-    )
-
-    grouped_keys = {key for _, keys in FIELD_GROUPS for key in keys}
-    for title, keys in FIELD_GROUPS:
+    lines.append("")
+    for title, keys in _combined_groups(records):
         section = _comparison_table(records, labels, keys)
-        if section:
+        if section or title == "Overview":
             lines += [f"## {title}", ""] + section
-
-    remaining = [
-        key
-        for key in _ordered_keys(records)
-        if key not in grouped_keys and key not in LONG_FIELDS
-    ]
-    trailer = [key for key in remaining if key.startswith("trailer.")]
-    status = [key for key in remaining if key.startswith("status.")]
-    other = [
-        key
-        for key in remaining
-        if not key.startswith(("trailer.", "status."))
-    ]
-    if other:
-        lines += ["## Other fields", ""] + _comparison_table(records, labels, other)
-    if trailer:
-        lines += ["## Scan trailer extra (sampled)", ""] + _comparison_table(
-            records, labels, trailer
-        )
-    if status:
-        lines += ["## Status log (first scan)", ""] + _comparison_table(
-            records, labels, status
-        )
 
     filter_keys = [key for key in LONG_FIELDS if any(rec.get(key) for rec in records)]
     if filter_keys:
@@ -1335,12 +1347,203 @@ def write_combined_markdown(records: list[dict], dest: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# HTML output (self-contained pages that open in any browser)
+# ---------------------------------------------------------------------------
+
+HTML_CSS = """
+:root {
+  --bg: #ffffff; --fg: #1b2228; --muted: #5a6670; --rule: #dde2e6;
+  --head: #f1f4f5; --accent: #0b6e79; --error: #b42318;
+  color-scheme: light dark;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #12171b; --fg: #e3e8eb; --muted: #97a3ac; --rule: #2a343b;
+    --head: #1b2328; --accent: #5cc3cd; --error: #f97066;
+  }
+}
+body { margin: 0; background: var(--bg); color: var(--fg);
+  font: 15px/1.5 "Segoe UI", system-ui, -apple-system, sans-serif; }
+main { max-width: 72rem; margin: 0 auto; padding: 2rem 16px 3rem; }
+.eyebrow { margin: 0; font-size: 0.75rem; letter-spacing: 0.08em;
+  text-transform: uppercase; color: var(--accent); }
+h1 { margin: 0.2rem 0 0.3rem; font-size: 1.7rem; overflow-wrap: anywhere; }
+.meta { margin: 0; color: var(--muted); font-size: 0.9rem; overflow-wrap: anywhere; }
+section { margin-top: 1.8rem; }
+details { margin-top: 0.9rem; }
+section + details { margin-top: 1.8rem; }
+h2, summary { font-size: 1.1rem; font-weight: 600; margin: 0 0 0.6rem; }
+summary { cursor: pointer; }
+.scroll { overflow-x: auto; }
+table { border-collapse: collapse; font-variant-numeric: tabular-nums; }
+th, td { text-align: left; vertical-align: top; padding: 0.35rem 0.75rem;
+  border-bottom: 1px solid var(--rule); white-space: pre-wrap; }
+thead th { background: var(--head); font-weight: 600; white-space: nowrap; }
+.kv { width: 100%; max-width: 60rem; table-layout: fixed; }
+.kv th { width: 15rem; font-weight: 500; color: var(--muted); }
+.kv td { overflow-wrap: anywhere; }
+@media (max-width: 600px) { .kv th { width: 40%; } }
+.summary td { white-space: nowrap; }
+.compare th[scope=row] { position: sticky; left: 0; background: var(--bg);
+  font-weight: 500; color: var(--muted); white-space: nowrap; }
+.empty { color: var(--muted); }
+.error { color: var(--error); }
+.hint { margin: 0.6rem 0 0; color: var(--muted); font-size: 0.85rem; }
+a { color: var(--accent); }
+code, pre { font-family: Consolas, "Cascadia Mono", monospace; font-size: 13px; }
+pre { background: var(--head); padding: 0.8rem 1rem; border-radius: 4px;
+  overflow-x: auto; line-height: 1.45; }
+ul.filters { padding-left: 1.2rem; margin: 0; }
+""".strip()
+
+LABEL_WORDS = {
+    "mz": "m/z", "rt": "RT", "ms1": "MS1", "ms2": "MS2", "ms3": "MS3",
+    "id": "ID", "faims": "FAIMS", "cv": "CV", "min": "(min)", "mb": "(MB)",
+}
+
+
+def _h(text: object) -> str:
+    return html.escape(str(text))
+
+
+def _label(key: str) -> str:
+    """Readable field name: 'rt_start_min' -> 'RT start (min)'."""
+    if key in SUMMARY_LABELS:
+        return SUMMARY_LABELS[key]
+    if key.startswith(("trailer.", "status.")):
+        return key.split(".", 1)[1]
+    text = " ".join(LABEL_WORDS.get(word, word) for word in key.split("_"))
+    return text if text.startswith("m/z") else text[:1].upper() + text[1:]
+
+
+def _html_value(value: str) -> str:
+    return _h(value) if value else '<span class="empty">—</span>'
+
+
+def _html_kv_table(pairs: list[tuple[str, str]], keep_empty: bool = False) -> str:
+    rows = [(key, value) for key, value in pairs if value or keep_empty]
+    if not rows:
+        return ""
+    body = "".join(
+        f'<tr><th scope="row">{_h(_label(key))}</th><td>{_html_value(value)}</td></tr>'
+        for key, value in rows
+    )
+    return f'<table class="kv"><tbody>{body}</tbody></table>'
+
+
+def _html_section(title: str, content: str, collapsed: bool = False) -> str:
+    if not content:
+        return ""
+    if collapsed:
+        return f"<details><summary>{_h(title)}</summary>{content}</details>"
+    return f"<section><h2>{_h(title)}</h2>{content}</section>"
+
+
+def _html_page(title: str, eyebrow: str, meta: list[str], body: str) -> str:
+    meta_html = " · ".join(_h(item) for item in meta if item)
+    return (
+        "<!doctype html>\n"
+        '<html lang="en">\n<head>\n<meta charset="utf-8">\n'
+        '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
+        f"<title>{_h(title)}</title>\n<style>\n{HTML_CSS}\n</style>\n</head>\n<body>\n<main>\n"
+        f'<header><p class="eyebrow">{_h(eyebrow)}</p><h1>{_h(title)}</h1>'
+        f'<p class="meta">{meta_html}</p></header>\n'
+        f"{body}\n</main>\n</body>\n</html>\n"
+    )
+
+
+def write_individual_html(record: OrderedDict[str, str] | dict, dest: Path) -> None:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    generated = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
+    meta = [
+        record.get("file_path", ""),
+        f"{record['file_size_mb']} MB" if record.get("file_size_mb") else "",
+        f"Generated {generated}",
+    ]
+    parts: list[str] = []
+    if record.get("error"):
+        parts.append(f'<p class="error"><b>Could not read this file:</b> {_h(record["error"])}</p>')
+    else:
+        parts.append(_html_section("Summary", _html_kv_table(_summary_rows(record), keep_empty=True)))
+        main_titles = {title for title, _ in FIELD_GROUPS}
+        for title, pairs in _report_groups(record):
+            parts.append(_html_section(title, _html_kv_table(pairs), title not in main_titles))
+        if record.get("scan_filters"):
+            items = "".join(
+                f"<li><code>{_h(filt)}</code></li>" for filt in record["scan_filters"].split(" | ")
+            )
+            parts.append(_html_section("Scan filters", f'<ul class="filters">{items}</ul>', True))
+        if record.get("instrument_method_text"):
+            parts.append(_html_section(
+                "Instrument method", f"<pre>{_h(record['instrument_method_text'])}</pre>", True
+            ))
+    page = _html_page(record.get("file_name", "RAW file"), "Thermo RAW report", meta, "\n".join(parts))
+    dest.write_text(page, encoding="utf-8")
+
+
+def write_combined_html(records: list[dict], dest: Path) -> None:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    generated = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
+    labels = _column_labels(records)
+
+    head = "".join(f'<th scope="col">{_h(SUMMARY_LABELS[key])}</th>' for key in SUMMARY_KEYS)
+    rows = []
+    for rec in records:
+        report = rec.get("_report_path", "")
+        name = _h(rec.get("file_name", ""))
+        file_cell = f'<a href="{_h(Path(report).name)}">{name}</a>' if report else name
+        if rec.get("error"):
+            cells = f'<td colspan="{len(SUMMARY_KEYS) - 1}" class="error">{_h(rec["error"])}</td>'
+        else:
+            cells = "".join(f"<td>{_h(rec.get(key, ''))}</td>" for key in SUMMARY_KEYS[1:])
+        rows.append(f"<tr><td>{file_cell}</td>{cells}</tr>")
+    summary = (
+        f'<div class="scroll"><table class="summary"><thead><tr>{head}</tr></thead>'
+        f'<tbody>{"".join(rows)}</tbody></table></div>'
+        '<p class="hint">Click a file name to open its full report. '
+        "To copy this table into Excel, select it with the mouse and paste.</p>"
+    )
+    parts = [_html_section("Summary", summary)]
+
+    col_head = '<th scope="col">Field</th>' + "".join(
+        f'<th scope="col">{_h(label)}</th>' for label in labels
+    )
+    for title, keys in _combined_groups(records):
+        if title == "Overview":  # already covered by the summary table
+            continue
+        comparison = _comparison_rows(records, keys)
+        if not comparison:
+            continue
+        body = "".join(
+            f'<tr><th scope="row">{_h(_label(key))}</th>'
+            + "".join(f"<td>{_h(value)}</td>" for value in values)
+            + "</tr>"
+            for key, values in comparison
+        )
+        table = (
+            f'<div class="scroll"><table class="compare"><thead><tr>{col_head}</tr></thead>'
+            f"<tbody>{body}</tbody></table></div>"
+        )
+        parts.append(_html_section(title, table, collapsed=True))
+
+    meta = [f"{len(records)} files", str(dest.parent), f"Generated {generated}"]
+    page = _html_page("Thermo RAW metadata", "Combined report", meta, "\n".join(parts))
+    dest.write_text(page, encoding="utf-8")
+
+
+WRITERS = {
+    "html": (".html", write_individual_html, write_combined_html),
+    "md": (".md", write_individual_markdown, write_combined_markdown),
+}
+
+
+# ---------------------------------------------------------------------------
 # Parallel analysis / CLI
 # ---------------------------------------------------------------------------
 
 
-def analyze_one(path_str: str) -> dict:
-    """Worker: extract one RAW file and write its individual markdown report."""
+def analyze_one(path_str: str, fmt: str = "html") -> dict:
+    """Worker: extract one RAW file and write its individual report."""
     path = Path(path_str)
     try:
         record = extract_raw_metadata(path, include_method_text=True)
@@ -1353,8 +1556,9 @@ def analyze_one(path_str: str) -> dict:
                 ("error", str(exc)),
             )
         )
-    dest = unique_path(path.parent, path.stem)
-    write_individual_markdown(record, dest)
+    suffix, write_individual, _ = WRITERS[fmt]
+    dest = unique_path(path.parent, path.stem, suffix)
+    write_individual(record, dest)
     payload = dict(record)
     payload["_report_path"] = str(dest)
     return payload
@@ -1365,7 +1569,7 @@ def default_workers(count: int) -> int:
     return max(1, min(count, cpu, 8))
 
 
-def process(paths: list[Path], workers: int | None = None) -> list[Path]:
+def process(paths: list[Path], workers: int | None = None, fmt: str = "html") -> list[Path]:
     if not paths:
         raise SystemExit("No .raw files found.")
 
@@ -1376,7 +1580,7 @@ def process(paths: list[Path], workers: int | None = None) -> list[Path]:
     if len(paths) == 1 or worker_count == 1:
         for index, path in enumerate(paths):
             print(f"  [{index + 1}/{len(paths)}] {path.name}")
-            records[index] = analyze_one(str(path))
+            records[index] = analyze_one(str(path), fmt)
             report = records[index].get("_report_path", "")
             if report:
                 print(f"    -> {report}")
@@ -1384,7 +1588,7 @@ def process(paths: list[Path], workers: int | None = None) -> list[Path]:
                 print(f"    ! {records[index]['error']}")
     else:
         with ProcessPoolExecutor(max_workers=worker_count) as pool:
-            futures = {pool.submit(analyze_one, str(path)): index for index, path in enumerate(paths)}
+            futures = {pool.submit(analyze_one, str(path), fmt): index for index, path in enumerate(paths)}
             done = 0
             for future in as_completed(futures):
                 index = futures[future]
@@ -1401,8 +1605,9 @@ def process(paths: list[Path], workers: int | None = None) -> list[Path]:
     if len(records) >= 2:
         wrap_dir = common_parent(paths)
         wrap_dir.mkdir(parents=True, exist_ok=True)
-        wrap_path = unique_path(wrap_dir, "raw_metadata")
-        write_combined_markdown(records, wrap_path)
+        suffix, _, write_combined = WRITERS[fmt]
+        wrap_path = unique_path(wrap_dir, "raw_metadata", suffix)
+        write_combined(records, wrap_path)
         written.append(wrap_path)
         print(f"Wrote combined report {wrap_path}")
 
@@ -1433,6 +1638,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Parallel workers for individual files (default: min(files, CPUs, 8))",
     )
     parser.add_argument(
+        "--format",
+        choices=sorted(WRITERS),
+        default="html",
+        help="Report format: html (opens in any browser, default) or md (Markdown)",
+    )
+    parser.add_argument(
         "--setup",
         action="store_true",
         help="Download Thermo RawFileReader DLLs and verify the reader loads",
@@ -1458,7 +1669,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     try:
-        process(paths, workers=args.workers)
+        process(paths, workers=args.workers, fmt=args.format)
     except Exception:
         traceback.print_exc()
         return 1
