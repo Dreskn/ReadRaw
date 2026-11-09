@@ -5,31 +5,45 @@ $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $Root
 
-function Find-Python {
-    $hints = @(
-        "$env:LocalAppData\Programs\Python\Python312\python.exe",
-        "$env:LocalAppData\Programs\Python\Python311\python.exe",
-        "$env:LocalAppData\Programs\Python\Python310\python.exe",
-        "$env:LocalAppData\Programs\Python\Python313\python.exe"
-    )
-    foreach ($hint in $hints) {
-        if (Test-Path -LiteralPath $hint) { return $hint }
-    }
+# pythonnet supports Python 3.10 to 3.15.
+$MinorVersions = @(12, 13, 11, 14, 10, 15)
 
-    foreach ($version in @("3.12", "3.11", "3.10", "3.13", "3")) {
-        try {
-            $exe = & py "-$version" -c "import sys; print(sys.executable)" 2>$null
-            if ($LASTEXITCODE -eq 0 -and $exe -and (Test-Path -LiteralPath $exe.Trim())) {
-                $candidate = $exe.Trim()
-                if ($candidate -notmatch "WindowsApps") {
-                    return $candidate
-                }
-            }
-        } catch {
-            continue
+# Runs a candidate and returns its real executable path if it is a supported Python.
+# The Microsoft Store "python" stub fails to run, so it is rejected here.
+function Test-Python([string]$Exe, [string[]]$Prefix = @()) {
+    $check = "import sys; print(sys.executable if (3, 10) <= sys.version_info[:2] <= (3, 15) else '')"
+    try {
+        $out = & $Exe @Prefix -c $check 2>$null
+        if ($LASTEXITCODE -eq 0 -and $out) {
+            $path = ([string]$out).Trim()
+            if ($path -and (Test-Path -LiteralPath $path)) { return $path }
         }
+    } catch {}
+    return $null
+}
+
+function Find-Python {
+    $ErrorActionPreference = "Continue"
+    $found = @()
+    foreach ($minor in $MinorVersions) {
+        foreach ($dir in @(
+            "$env:LocalAppData\Programs\Python\Python3$minor",
+            "$env:ProgramFiles\Python3$minor",
+            "$env:LocalAppData\Python\pythoncore-3.$minor-64"
+        )) {
+            $exe = Join-Path $dir "python.exe"
+            if (Test-Path -LiteralPath $exe) { $found += Test-Python $exe }
+        }
+        if (Get-Command py -ErrorAction SilentlyContinue) { $found += Test-Python "py" @("-3.$minor") }
     }
-    throw "Python 3.10+ was not found. Install Python from https://www.python.org/ and tick 'Add python.exe to PATH'."
+    if (Get-Command python -ErrorAction SilentlyContinue) { $found += Test-Python "python" }
+
+    $found = @($found | Where-Object { $_ })
+    # Prefer a regular install; Microsoft Store / install-manager Pythons also work.
+    $regular = @($found | Where-Object { $_ -notmatch "WindowsApps" })
+    if ($regular.Count -gt 0) { return $regular[0] }
+    if ($found.Count -gt 0) { return $found[0] }
+    throw "Python 3.10 to 3.15 was not found. Install Python from https://www.python.org/ and tick 'Add python.exe to PATH'."
 }
 
 Write-Host "=== ReadRaw setup ==="
