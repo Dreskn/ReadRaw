@@ -86,6 +86,7 @@ SUMMARY_LABELS = {
 
 # Header/filter/trailer only — never walk every spectrum in a multi-GB file.
 SCAN_WALK_CAP = 250
+RUN_SAMPLE_POINTS = 200
 MS2_TRAILERS_NEEDED = 3
 
 RESOLUTION_TRAILER_KEYS = (
@@ -640,6 +641,9 @@ def resolution_from_trailers(trailers: list[OrderedDict[str, str]]) -> str:
             value = trailer.get(key, "")
             if value:
                 compact = value.replace(",", "").strip()
+                # Non-Orbitrap scans (e.g. Astral MS2) report a resolution of 0.
+                if compact in {"0", "0.0"}:
+                    continue
                 if compact and compact not in values:
                     values.append(compact)
     return join_unique(values)
@@ -734,13 +738,24 @@ def inspect_scans(raw, first: int, last: int) -> dict:
                             result["precursor_masses"].append(reaction["PrecursorMass"])
         return order
 
+    def have_trailers() -> bool:
+        trailers = result["trailers_by_order"]
+        return bool(trailers["ms1"]) and len(trailers["ms2"]) >= MS2_TRAILERS_NEEDED
+
     walk_end = min(last, first + SCAN_WALK_CAP - 1)
     for scan in range(first, walk_end + 1):
         consume(scan)
-        if result["trailers_by_order"]["ms1"] and (
-            result["trailers_by_order"]["ms2"] or not result["saw_ms2"]
-        ):
+        if have_trailers():
             break
+
+    # MS2 can start minutes into a run (scan 631 on a QE HF run), so also
+    # sample scan headers evenly across the rest of the run.
+    if not have_trailers() and last > walk_end:
+        step = max(1, (last - walk_end) // RUN_SAMPLE_POINTS)
+        for scan in range(walk_end + 1, last + 1, step):
+            consume(scan)
+            if have_trailers():
+                break
 
     for scan in extra_points:
         consume(scan, need_trailer=False)
@@ -1333,7 +1348,11 @@ def write_combined_markdown(records: list[dict], dest: Path) -> None:
         if section or title == "Overview":
             lines += [f"## {title}", ""] + section
 
-    filter_keys = [key for key in LONG_FIELDS if any(rec.get(key) for rec in records)]
+    filter_keys = [
+        key
+        for key in PREFERRED_COLUMNS
+        if key in LONG_FIELDS and any(rec.get(key) for rec in records)
+    ]
     if filter_keys:
         lines += [
             "## Long text fields",
